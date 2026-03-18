@@ -343,6 +343,36 @@ def multi_timeframe_confluence(
     )
 
 
+
+# ── SMA ───────────────────────────────────────────────────────────────────────
+
+def sma(prices: list[float], period: int) -> list[float]:
+    """Simple moving average list."""
+    if len(prices) < period:
+        return []
+    return [sum(prices[i:i + period]) / period for i in range(len(prices) - period + 1)]
+
+
+def sma_last(prices: list[float], period: int) -> float | None:
+    """Last SMA value."""
+    vals = sma(prices, period)
+    return vals[-1] if vals else None
+
+
+# ── ROC (Rate of Change) ──────────────────────────────────────────────────────
+
+def roc(prices: list[float], period: int = 10) -> float | None:
+    """Rate of Change: % change vs `period` bars ago.
+    Positive = upward momentum, negative = downward momentum.
+    """
+    if len(prices) < period + 1:
+        return None
+    past = prices[-(period + 1)]
+    if past == 0:
+        return None
+    return (prices[-1] - past) / past * 100
+
+
 # ── Z-score ───────────────────────────────────────────────────────────────────
 
 def zscore(values: list[float]) -> float | None:

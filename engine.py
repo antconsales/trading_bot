@@ -32,6 +32,15 @@ from pump_detector import pump_detector, PumpCandidate
 
 logger = logging.getLogger(__name__)
 
+# Correlation groups -- don't open two symbols from the same group simultaneously
+_CORR_GROUPS: list[set[str]] = [
+    {"XRPUSDC", "XLMUSDC", "ADAUSDC"},
+    {"DOGEUSDC", "PEPEUSDC", "SHIBUSDC"},
+    {"SOLUSDC", "SUIUSDC", "NEARUSDC"},
+    {"BTCUSDC", "ETHUSDC"},
+]
+
+
 # ZeroClaw workspace IPC files
 _ZEROCLAW_WORKSPACE = Path.home() / ".zeroclaw" / "workspace"
 _STATUS_FILE = _ZEROCLAW_WORKSPACE / "pi_trader_status.json"
@@ -74,6 +83,20 @@ class TradingEngine:
 
         # Consecutive loss tracker
         self._consecutive_losses: int = 0
+        # Per-symbol sell cooldowns (30min anti-loop)
+        self._sell_cooldowns: dict[str, float] = {}
+
+        # DCA state: extra buys per symbol (max 2)
+        self._dca_counts: dict[str, int] = {}
+
+        # Equity / drawdown tracking
+        self._equity_history: list[tuple[float, float]] = []
+        self._peak_equity: float = 0.0
+        self._max_drawdown: float = 0.0
+
+        # Daily report
+        self._last_report_date: str = ""
+
 
     # ── State ─────────────────────────────────────────────────────────────────
 
@@ -144,7 +167,7 @@ class TradingEngine:
 
     # ── Position management ───────────────────────────────────────────────────
 
-    async def _manage_positions(self) -> None:
+    async def _manage_positions(self, portfolio_value: float = 0.0) -> None:
         """Check each open position for stop/TP/trail/timeout."""
         positions = db.get_positions()
         for pos in positions:
@@ -224,8 +247,165 @@ class TradingEngine:
                     age_h = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
                     if age_h >= config.max_hold_hours:
                         await self._close_position(symbol, qty, price, "timeout")
+                        continue
                 except Exception:
                     pass
+
+            # DCA: average down if losing and MTF still bullish
+            await self._try_dca(pos, portfolio_value)
+
+
+    # ── Correlation filter ────────────────────────────────────────────────────
+
+    def _is_correlated(self, sym_a: str, sym_b: str) -> bool:
+        for group in _CORR_GROUPS:
+            if sym_a in group and sym_b in group:
+                return True
+        return False
+
+    def _has_correlated_open(self, symbol: str) -> bool:
+        open_symbols = {p["symbol"] for p in db.get_positions()}
+        return any(self._is_correlated(symbol, s) for s in open_symbols if s != symbol)
+
+    # ── Sell cooldown ─────────────────────────────────────────────────────────
+
+    def _record_sell_cooldown(self, symbol: str) -> None:
+        self._sell_cooldowns[symbol] = time.time()
+
+    def _in_sell_cooldown(self, symbol: str, cooldown_sec: int = 1800) -> bool:
+        last_sell = self._sell_cooldowns.get(symbol, 0.0)
+        return (time.time() - last_sell) < cooldown_sec
+
+    # ── Equity & drawdown tracking ────────────────────────────────────────────
+
+    def _update_equity(self, portfolio_value: float) -> None:
+        now = time.time()
+        self._equity_history.append((now, portfolio_value))
+        cutoff = now - 86400
+        self._equity_history = [(t, v) for t, v in self._equity_history if t >= cutoff]
+        if portfolio_value > self._peak_equity:
+            self._peak_equity = portfolio_value
+        if self._peak_equity > 0:
+            dd = (self._peak_equity - portfolio_value) / self._peak_equity * 100
+            if dd > self._max_drawdown:
+                self._max_drawdown = dd
+
+    # ── Daily report ──────────────────────────────────────────────────────────
+
+    async def _check_daily_report(self) -> None:
+        now = datetime.now(timezone.utc)
+        if now.hour != 20:
+            return
+        today = now.date().isoformat()
+        if self._last_report_date == today:
+            return
+        self._last_report_date = today
+        await self._send_daily_report()
+
+    async def _send_daily_report(self) -> None:
+        try:
+            today_pnl = db.get_today_pnl()
+            trades = db.get_trades(limit=50)
+            today_str = datetime.now(timezone.utc).date().isoformat()
+            day_trades = [t for t in trades if t["ts"].startswith(today_str)]
+            wins = sum(1 for t in day_trades if t["action"] in ("sell", "partial_sell") and t["pnl"] > 0)
+            sells = sum(1 for t in day_trades if t["action"] in ("sell", "partial_sell"))
+            wr = wins / sells * 100 if sells else 0
+            portfolio_value = await self._get_portfolio_value()
+            dd_str = f"{self._max_drawdown:.1f}%" if self._max_drawdown > 0 else "0%"
+            positions = db.get_positions()
+            pos_names = [p["symbol"].replace("USDC", "") for p in positions]
+            pos_str = ", ".join(pos_names) if pos_names else "nessuna"
+            pnl_emoji = "\U0001f4c8" if today_pnl >= 0 else "\U0001f4c9"
+            lines = [
+                "<b>\U0001f4ca Daily Report " + today_str + "</b>",
+                "",
+                pnl_emoji + " PnL oggi: <b>" + f"{today_pnl:+.2f}" + " USDC</b>",
+                "\U0001f3af Trade: " + str(len(day_trades)) + " | Win rate: " + f"{wr:.0f}%",
+                "\U0001f4bc Portfolio: " + f"{portfolio_value:.2f}" + " USDC",
+                "\U0001f4c9 Max drawdown (24h): " + dd_str,
+                "\U0001f4cc Posizioni aperte: " + pos_str,
+                "\U0001f534 Consecutive losses: " + str(self._consecutive_losses),
+            ]
+            await notify.send("\n".join(lines))
+            self._max_drawdown = 0.0
+            self._peak_equity = portfolio_value
+        except Exception as e:
+            logger.warning(f"Daily report error: {e}")
+
+    # ── DCA (Dollar-Cost Averaging) ───────────────────────────────────────────
+
+    async def _try_dca(self, pos: dict, portfolio_value: float) -> bool:
+        symbol = pos["symbol"]
+        dca_count = self._dca_counts.get(symbol, 0)
+        if dca_count >= 2:
+            return False
+        try:
+            price = await client.ticker_price(symbol)
+        except Exception:
+            return False
+        entry = pos["entry_price"]
+        loss_pct = (entry - price) / entry if entry > 0 else 0
+        if loss_pct < 0.015:
+            return False
+        try:
+            candles = await client.klines(symbol, "15m", limit=20)
+            closes = [c["close"] for c in candles]
+            highs  = [c["high"]  for c in candles]
+            lows   = [c["low"]   for c in candles]
+            atr_v  = ind.atr(highs, lows, closes) or (price * 0.015)
+        except Exception:
+            atr_v = price * 0.015
+        loss_abs = entry - price
+        if loss_abs < 1.5 * atr_v:
+            return False
+        try:
+            c5m, c1h, c4h = await asyncio.gather(
+                client.klines(symbol, "5m", limit=60),
+                client.klines(symbol, "1h", limit=60),
+                client.klines(symbol, "4h", limit=60),
+            )
+            mtf = ind.multi_timeframe_confluence(c5m, c1h, c4h)
+            if mtf.direction != "long" or mtf.score < 15:
+                return False
+        except Exception:
+            return False
+        quote_qty = self._position_size(pos.get("pool", "safe"), portfolio_value) * 0.5
+        if quote_qty < 5:
+            return False
+        try:
+            result = await client.market_buy(symbol, quote_qty)
+            if config.paper_mode:
+                exec_price = result["price"]
+                extra_qty = result["qty"]
+            else:
+                exec_price = float(
+                    result.get("fills", [{}])[0].get("price", price)
+                    if result.get("fills") else price
+                )
+                extra_qty = float(result.get("executedQty", quote_qty / price))
+        except BinanceError as e:
+            logger.error(f"DCA buy error {symbol}: {e}")
+            return False
+        old_qty = pos["qty"]
+        new_qty = old_qty + extra_qty
+        new_avg = (entry * old_qty + exec_price * extra_qty) / new_qty
+        new_stop = new_avg - config.stop_loss_atr * atr_v
+        new_tp   = new_avg + config.take_profit_atr * atr_v
+        db.update_position(symbol, entry_price=new_avg, qty=new_qty, stop_loss=new_stop, take_profit=new_tp)
+        db.record_trade(
+            symbol=symbol, action="buy", price=exec_price, qty=extra_qty,
+            pnl=0.0, reason=f"dca_{dca_count + 1}", is_paper=config.paper_mode,
+        )
+        self._dca_counts[symbol] = dca_count + 1
+        logger.info(f"DCA #{dca_count + 1} {symbol}: +{extra_qty:.4f} @ {exec_price:.4f} new_avg={new_avg:.4f}")
+        await notify.send(
+            "\U0001f504 DCA #" + str(dca_count + 1) + " " + symbol + "\n"
+            "Aggiunto " + f"{extra_qty:.4f}" + " @ " + f"{exec_price:.4f}" + "\n"
+            "Avg entry: " + f"{new_avg:.4f}" + " | Qty: " + f"{new_qty:.4f}" + "\n"
+            "Stop: " + f"{new_stop:.4f}" + " | TP: " + f"{new_tp:.4f}"
+        )
+        return True
 
     async def _close_position(self, symbol: str, qty: float, price: float, reason: str) -> None:
         pos = db.get_position(symbol)
@@ -246,6 +426,8 @@ class TradingEngine:
             pnl=pnl, reason=reason, tier=tier, is_paper=config.paper_mode,
         )
         db.delete_position(symbol)
+        self._record_sell_cooldown(symbol)
+        self._dca_counts.pop(symbol, None)
 
         emoji = "✅" if pnl > 0 else "❌"
         await notify.send(
@@ -428,6 +610,16 @@ class TradingEngine:
 
         # Check if already in position
         if db.get_position(sig.symbol):
+            return False
+
+        # Sell cooldown -- 30min anti-loop
+        if self._in_sell_cooldown(sig.symbol):
+            logger.debug(f"Sell cooldown active for {sig.symbol} -- skip")
+            return False
+
+        # Correlation filter
+        if self._has_correlated_open(sig.symbol):
+            logger.debug(f"Correlated position open -- skip {sig.symbol}")
             return False
 
         # LLM validation
@@ -661,7 +853,7 @@ class TradingEngine:
         portfolio_value = await self._get_portfolio_value()
 
         # 1. Manage open positions
-        await self._manage_positions()
+        await self._manage_positions(portfolio_value)
 
         # 2. Check pump candidates
         if self._mode == "full":
@@ -705,6 +897,10 @@ class TradingEngine:
                 sig = await self._build_signal(symbol, source="standard", pool="aggressive")
                 if sig:
                     await self._evaluate_entry(sig, portfolio_value)
+
+        # Update equity tracking and check daily report
+        self._update_equity(portfolio_value)
+        await self._check_daily_report()
 
         # Write status snapshot for ZeroClaw/pitonybot
         self._write_status_file()
@@ -800,10 +996,104 @@ class TradingEngine:
                 logger.warning(f"WS monitor error: {e} — retrying in 5s")
                 await asyncio.sleep(5)
 
+
+    # ── Portfolio import & dust conversion ───────────────────────────────────
+
+    async def _import_existing_positions(self) -> None:
+        """On startup: import existing Binance balances as managed positions."""
+        try:
+            balances = await client.get_all_balances()
+        except Exception as e:
+            logger.warning(f"Portfolio import failed: {e}")
+            return
+
+        symbol_map = {}
+        for sym in config.safe_symbols:
+            base = sym.replace("USDC", "")
+            symbol_map[base] = (sym, "safe")
+        for sym in config.aggr_symbols:
+            base = sym.replace("USDC", "")
+            symbol_map[base] = (sym, "aggressive")
+
+        imported = 0
+        for asset, qty in balances.items():
+            if asset == "USDC" or asset not in symbol_map:
+                continue
+            symbol, pool = symbol_map[asset]
+            if db.get_position(symbol):
+                continue
+            try:
+                price = await client.ticker_price(symbol)
+                value_usdc = qty * price
+                if value_usdc < 5.0:
+                    continue
+                try:
+                    candles = await client.klines(symbol, "15m", limit=20)
+                    closes = [c["close"] for c in candles]
+                    highs  = [c["high"]  for c in candles]
+                    lows   = [c["low"]   for c in candles]
+                    atr_v  = ind.atr(highs, lows, closes) or (price * 0.015)
+                except Exception:
+                    atr_v = price * 0.015
+                stop = price - config.stop_loss_atr * atr_v
+                tp   = price + config.take_profit_atr * atr_v
+                db.save_position(
+                    symbol=symbol, entry_price=price, qty=qty,
+                    pool=pool, stop_loss=stop, take_profit=tp,
+                )
+                logger.info(f"Imported: {symbol} qty={qty:.4f} @ {price:.4f} (${value_usdc:.2f}) stop={stop:.4f} tp={tp:.4f}")
+                imported += 1
+            except Exception as e:
+                logger.warning(f"Import error {asset}: {e}")
+
+        if imported:
+            await notify.send(
+                f"\U0001f4e5 <b>Portfolio importato</b>: {imported} posizioni rilevate e prese in gestione."
+            )
+        else:
+            logger.info("Portfolio import: no new positions to import")
+
+    async def _convert_unknown_to_usdc(self) -> None:
+        """Convert non-trading, non-USDC assets to USDC (dust cleanup)."""
+        if config.paper_mode:
+            return
+        try:
+            balances = await client.get_all_balances()
+        except Exception as e:
+            logger.warning(f"Dust conversion fetch failed: {e}")
+            return
+
+        known_assets = {"USDC"} | {s.replace("USDC", "") for s in config.all_symbols}
+        converted = []
+
+        for asset, qty in balances.items():
+            if asset in known_assets:
+                continue
+            symbol = f"{asset}USDC"
+            try:
+                price = await client.ticker_price(symbol)
+                value = qty * price
+                if value < 1.0:
+                    continue
+                await client.market_sell(symbol, qty)
+                converted.append(f"{asset} \u2192 {value:.2f} USDC")
+                logger.info(f"Dust converted: {asset} qty={qty} -> ${value:.2f} USDC")
+            except Exception:
+                pass
+
+        if converted:
+            await notify.send(
+                "\U0001f9f9 <b>Dust convertito in USDC</b>:\n" + "\n".join(f"  \u2022 {c}" for c in converted)
+            )
+
     async def start(self) -> None:
         self._running = True
         self._ws_prices: dict[str, float] = {}
         logger.info("TradingEngine started")
+
+        # Import existing Binance positions and clean dust on startup
+        await self._import_existing_positions()
+        await self._convert_unknown_to_usdc()
 
         # Start WebSocket position monitor as background task
         ws_task = asyncio.create_task(self._ws_position_monitor())
@@ -836,6 +1126,8 @@ class TradingEngine:
             "today_pnl": round(today_pnl, 2),
             "consecutive_losses": self._consecutive_losses,
             "paper_mode": config.paper_mode,
+            "max_drawdown_pct": round(self._max_drawdown, 2),
+            "peak_equity": round(self._peak_equity, 2),
         }
 
 
