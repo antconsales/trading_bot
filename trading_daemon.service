@@ -1,0 +1,30 @@
+[Unit]
+Description=Pi Trader — Autonomous Crypto Trading Bot
+After=network-online.target ollama.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__HOME__/pi_trader
+ExecStart=__HOME__/pi_trader/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=30s
+
+# Environment
+EnvironmentFile=__HOME__/pi_trader/.env
+Environment=PYTHONUNBUFFERED=1
+
+# Resource limits (Pi 4 friendly)
+MemoryMax=512M
+CPUQuota=80%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pi-trader
+
+[Install]
+WantedBy=multi-user.target

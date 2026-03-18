@@ -1,0 +1,24 @@
+# Secrets — mai in git
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# DB locale
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+pi_trader.log
+
+# Backtest output
+backtest_report.json
