@@ -21,6 +21,35 @@ from notify import notify
 logger = logging.getLogger(__name__)
 
 
+
+def _persist_to_env(updates: dict[str, str]) -> None:
+    """Write key=value pairs to the pi_trader .env file (create or update)."""
+    import os
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    try:
+        lines: list[str] = []
+        existing_keys: set[str] = set()
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#") and "=" in stripped:
+                        k = stripped.split("=", 1)[0].strip()
+                        if k in updates:
+                            lines.append(f"{k}={updates[k]}\n")
+                            existing_keys.add(k)
+                            continue
+                    lines.append(line if line.endswith("\n") else line + "\n")
+        # Append any keys not already in file
+        for k, v in updates.items():
+            if k not in existing_keys:
+                lines.append(f"{k}={v}\n")
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+        logger.info(f"Persisted to .env: {list(updates.keys())}")
+    except Exception as e:
+        logger.warning(f"Failed to persist .env: {e}")
+
 def _win_rate(signals: list[dict]) -> float:
     acted = [s for s in signals if s["acted_on"]]
     if not acted:

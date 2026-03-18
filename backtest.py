@@ -117,6 +117,16 @@ class BacktestParams:
     tp_atr_mult: float   = 2.0
 
 
+
+def _aligned_tf(all_candles: list[dict], max_ot: int, limit: int = 60) -> list[dict]:
+    """Return last `limit` candles from all_candles where open_time <= max_ot.
+    This makes MTF time-aware: at 5m bar i we only see the 1h/4h history up to
+    that point — no lookahead bias.
+    """
+    result = [c for c in all_candles if c["open_time"] <= max_ot]
+    return result[-limit:] if result else []
+
+
 def _score_candle(
     idx: int,
     closes: list[float],
@@ -126,6 +136,7 @@ def _score_candle(
     params: BacktestParams,
     candles_1h: list[dict],
     candles_4h: list[dict],
+    open_time_ms: int = 0,
 ) -> float:
     """Score a single 5m candle index. Returns -100..+100."""
     if idx < 60:
@@ -144,10 +155,13 @@ def _score_candle(
         return [{"close": c, "high": h, "low": l, "volume": v, "open": c}
                 for c, h, l, v in zip(cs, hs, ls, vs)]
 
+    # Time-aware: only use 1h/4h candles visible at this 5m bar's time
+    tf1h = _aligned_tf(candles_1h, open_time_ms) if open_time_ms else candles_1h[-60:]
+    tf4h = _aligned_tf(candles_4h, open_time_ms) if open_time_ms else candles_4h[-60:]
     mtf = ind.multi_timeframe_confluence(
         _make_candles(c5m_slice, h5m_slice, l5m_slice, v5m_slice),
-        candles_1h[-60:] if len(candles_1h) >= 60 else candles_1h,
-        candles_4h[-60:] if len(candles_4h) >= 60 else candles_4h,
+        tf1h if len(tf1h) >= 10 else candles_1h[-60:],
+        tf4h if len(tf4h) >= 6  else candles_4h[-60:],
         rsi_oversold=params.rsi_oversold,
         rsi_overbought=params.rsi_overbought,
     )
@@ -222,7 +236,8 @@ def simulate_trades(
 
     for i in range(60, len(closes)):
         if not in_trade:
-            score = _score_candle(i, closes, highs, lows, volumes, params, candles_1h, candles_4h)
+            ot_ms = candles_5m[i].get("open_time", 0)
+            score = _score_candle(i, closes, highs, lows, volumes, params, candles_1h, candles_4h, ot_ms)
             if score >= entry_score_min:
                 atr_v = ind.atr(highs[:i+1], lows[:i+1], closes[:i+1], 14)
                 if atr_v is None or atr_v == 0:

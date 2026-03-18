@@ -348,6 +348,14 @@ class TradingEngine:
                 "\U0001f534 Consecutive losses: " + str(self._consecutive_losses),
             ]
             await notify.send("\n".join(lines))
+            # Persist daily stats to performance table
+            db.upsert_performance(
+                date=today_str,
+                total_pnl=today_pnl,
+                win_rate=wr,
+                max_drawdown=self._max_drawdown,
+                trades_count=len(day_trades),
+            )
             self._max_drawdown = 0.0
             self._peak_equity = portfolio_value
         except Exception as e:
@@ -484,6 +492,7 @@ class TradingEngine:
         db.delete_position(symbol)
         self._record_sell_cooldown(symbol)
         self._dca_counts.pop(symbol, None)
+        self._last_close_reason[symbol] = reason
 
         emoji = "✅" if pnl > 0 else "❌"
         await notify.send(
@@ -660,8 +669,8 @@ class TradingEngine:
         """Full evaluation pipeline: score → LLM → execute."""
         sig.score = self._score_signal(sig)
 
-        # Pre-filter: skip low-score signals (no LLM call)
-        if sig.source not in ("listing",) and sig.score < 30:
+        # Pre-filter: skip very low-score signals (no LLM call)
+        if sig.source not in ("listing",) and sig.score < 20:
             db.save_signal(sig.symbol, sig.score, "skip", sig.source, acted_on=False)
             return False
 
@@ -677,6 +686,13 @@ class TradingEngine:
         # Sell cooldown -- 30min anti-loop
         if self._in_sell_cooldown(sig.symbol):
             logger.debug(f"Sell cooldown active for {sig.symbol} -- skip")
+            return False
+
+        # Smart re-entry: if last close was a stop loss, require stronger signal
+        last_reason = self._last_close_reason.get(sig.symbol, "")
+        min_score = 45.0 if "stop" in last_reason else 30.0
+        if sig.source not in ("listing",) and sig.score < min_score:
+            logger.debug(f"{sig.symbol} re-entry blocked: score {sig.score:.1f} < {min_score} (last={last_reason})")
             return False
 
         # Correlation filter

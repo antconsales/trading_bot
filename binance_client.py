@@ -281,6 +281,13 @@ client = BinanceClient()
 # ── Binance USDT-M Futures Client (for short selling) ─────────────────────────
 
 FUTURES_REST = "https://fapi.binance.com"
+def _spot_to_futures_symbol(symbol: str) -> str:
+    """Futures use USDT pairs, not USDC. BTCUSDC -> BTCUSDT."""
+    if symbol.endswith("USDC"):
+        return symbol[:-4] + "USDT"
+    return symbol
+
+
 
 
 class FuturesClient:
@@ -346,6 +353,36 @@ class FuturesClient:
         ) as r:
             return await r.json()
 
+
+    # Lot size cache: futures_symbol -> step size
+    _lot_sizes: dict[str, float] = {}
+
+    async def _get_lot_step(self, symbol: str) -> float:
+        """Fetch min lot step for a futures symbol. Cached."""
+        if symbol in self._lot_sizes:
+            return self._lot_sizes[symbol]
+        try:
+            info = await self._get("/fapi/v1/exchangeInfo")
+            for s in info.get("symbols", []):
+                if s["symbol"] == symbol:
+                    for f in s.get("filters", []):
+                        if f["filterType"] == "LOT_SIZE":
+                            step = float(f["stepSize"])
+                            self._lot_sizes[symbol] = step
+                            return step
+        except Exception:
+            pass
+        self._lot_sizes[symbol] = 0.001
+        return 0.001
+
+    @staticmethod
+    def _round_qty(qty: float, step: float) -> float:
+        if step <= 0:
+            return round(qty, 3)
+        import math
+        precision = max(0, -int(math.log10(step)))
+        return round(math.floor(qty / step) * step, precision)
+
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         """Set leverage for a symbol (idempotent)."""
         await self._post("/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
@@ -358,49 +395,55 @@ class FuturesClient:
             pass  # Already set
 
     async def futures_ticker_price(self, symbol: str) -> float:
-        data = await self._get("/fapi/v1/ticker/price", {"symbol": symbol})
+        """symbol can be spot (BTCUSDC) or futures (BTCUSDT) — auto-converts."""
+        fut_sym = _spot_to_futures_symbol(symbol)
+        data = await self._get("/fapi/v1/ticker/price", {"symbol": fut_sym})
         return float(data["price"])
 
     async def futures_market_short(self, symbol: str, usdc_qty: float) -> dict:
-        """Open a SHORT position. usdc_qty = USDC margin to use."""
+        """Open a SHORT position (One-Way Mode). usdc_qty = USDC notional margin."""
+        fut_sym = _spot_to_futures_symbol(symbol)
+        price = await self.futures_ticker_price(fut_sym)
         if config.paper_mode:
-            price = await self.futures_ticker_price(symbol)
             contracts = usdc_qty * config.futures_leverage / price
-            return {"price": price, "qty": contracts, "paper": True}
-        await self.set_leverage(symbol, config.futures_leverage)
-        await self.set_margin_type(symbol)
-        price = await self.futures_ticker_price(symbol)
-        qty = usdc_qty * config.futures_leverage / price
-        # Round to exchange step (simplified — use 3 decimal places)
-        qty = round(qty, 3)
+            return {"price": price, "qty": contracts, "symbol": fut_sym, "paper": True}
+        await self.set_leverage(fut_sym, config.futures_leverage)
+        await self.set_margin_type(fut_sym)
+        step = await self._get_lot_step(fut_sym)
+        qty = self._round_qty(usdc_qty * config.futures_leverage / price, step)
+        if qty <= 0:
+            raise BinanceError(-1, f"Lot size too small: {qty} for {fut_sym}")
+        # One-Way Mode: no positionSide field
         return await self._post("/fapi/v1/order", {
-            "symbol": symbol,
+            "symbol": fut_sym,
             "side": "SELL",
             "type": "MARKET",
-            "quantity": qty,
-            "positionSide": "SHORT",
+            "quantity": str(qty),
         })
 
     async def futures_close_short(self, symbol: str, qty: float) -> dict:
-        """Close a SHORT position by buying back."""
+        """Close a SHORT position (One-Way Mode, reduceOnly)."""
+        fut_sym = _spot_to_futures_symbol(symbol)
         if config.paper_mode:
-            price = await self.futures_ticker_price(symbol)
+            price = await self.futures_ticker_price(fut_sym)
             return {"price": price, "qty": qty, "paper": True}
+        step = await self._get_lot_step(fut_sym)
+        qty_r = self._round_qty(qty, step)
         return await self._post("/fapi/v1/order", {
-            "symbol": symbol,
+            "symbol": fut_sym,
             "side": "BUY",
             "type": "MARKET",
-            "quantity": round(qty, 3),
-            "positionSide": "SHORT",
+            "quantity": str(qty_r),
             "reduceOnly": "true",
         })
 
     async def futures_get_position(self, symbol: str) -> dict | None:
         """Get current futures position for symbol."""
-        data = await self._get("/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
+        fut_sym = _spot_to_futures_symbol(symbol)
+        data = await self._get("/fapi/v2/positionRisk", {"symbol": fut_sym}, signed=True)
         if isinstance(data, list):
             for p in data:
-                if p.get("symbol") == symbol and float(p.get("positionAmt", 0)) != 0:
+                if p.get("symbol") == fut_sym and float(p.get("positionAmt", 0)) != 0:
                     return p
         return None
 
