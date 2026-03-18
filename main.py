@@ -74,23 +74,26 @@ async def main() -> None:
     else:
         logger.error("Binance API unreachable — check internet connection")
 
-    # Pre-warm local LLM (model cold start takes 25s — do it now, not during first trade)
-    logger.info("Pre-warming local LLM (may take 30s)...")
-    try:
-        import aiohttp as _aiohttp
-        async with _aiohttp.ClientSession() as _s:
-            async with _s.post(
-                f"{config.local_ollama_url}/api/generate",
-                json={"model": config.local_model, "prompt": "ping", "stream": False,
-                      "options": {"num_predict": 1}},
-                timeout=_aiohttp.ClientTimeout(total=65),
-            ) as _r:
-                if _r.status == 200:
-                    logger.info("Local LLM warm and ready")
-                else:
-                    logger.warning(f"LLM pre-warm status: {_r.status}")
-    except Exception as _e:
-        logger.warning(f"LLM pre-warm failed (will retry on first trade): {_e}")
+    # Pre-warm local LLM — fire-and-forget so it doesn't block ZeroClaw responses
+    async def _prewarm():
+        try:
+            import aiohttp as _aiohttp
+            async with _aiohttp.ClientSession() as _s:
+                async with _s.post(
+                    f"{config.local_ollama_url}/api/generate",
+                    json={"model": config.local_model, "prompt": "ping", "stream": False,
+                          "options": {"num_predict": 1}},
+                    timeout=_aiohttp.ClientTimeout(total=65),
+                ) as _r:
+                    if _r.status == 200:
+                        logger.info("Local LLM warm and ready")
+                    else:
+                        logger.warning(f"LLM pre-warm status: {_r.status}")
+        except Exception as _e:
+            logger.warning(f"LLM pre-warm failed (will retry on first trade): {_e}")
+
+    asyncio.create_task(_prewarm())
+    logger.info("LLM pre-warm started in background (non-blocking)")
 
     # Send startup notification
     await notify.send_startup()
