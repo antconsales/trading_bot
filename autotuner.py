@@ -14,6 +14,7 @@ import os
 from datetime import datetime, timezone, timedelta
 
 import db
+import backtest as bt
 from config import config
 from notify import notify
 
@@ -144,25 +145,55 @@ def apply_adjustments(results: dict) -> list[str]:
 
 
 async def run_autotuner() -> None:
-    logger.info("Autotuner: running weekly backtest...")
-    results = run_backtest()
-    changes = apply_adjustments(results)
+    logger.info("Autotuner: running weekly backtest (real OHLCV)...")
 
-    report = (
-        f"🔧 <b>Weekly Autotuner Report</b>\n"
-        f"Trades: {results['trade_count']} | "
-        f"Win rate: {results['win_rate']:.0%} | "
-        f"PnL: {results['total_pnl']:+.2f} USDC\n"
-        f"Max loss: {results['max_single_loss']:.2f} USDC\n"
-    )
-    if changes:
-        report += "\n<b>Adjustments:</b>\n" + "\n".join(f"• {c}" for c in changes)
+    # Step 1: real Binance OHLCV grid search
+    ohlcv_changes: list[str] = []
+    try:
+        ohlcv_report = await bt.run_backtest(days=30)
+        agg = ohlcv_report.get("aggregate", {})
+        param_map = [
+            ("rsi_oversold",       "rsi_oversold",           "RSI_OVERSOLD",  "RSI OS"),
+            ("rsi_overbought",     "rsi_overbought",         "RSI_OVERBOUGHT","RSI OB"),
+            ("vol_ratio_threshold","volume_ratio_threshold", "VOL_RATIO",     "Vol ratio"),
+            ("stop_atr_mult",      "stop_loss_atr",          "STOP_ATR",      "Stop ATR"),
+            ("tp_atr_mult",        "take_profit_atr",        "TP_ATR",        "TP ATR"),
+        ]
+        import os
+        for key, cfg_attr, env_key, label in param_map:
+            new_val = agg.get(key)
+            if new_val is None:
+                continue
+            old_val = getattr(config, cfg_attr)
+            if abs(new_val - old_val) > 0.05:
+                setattr(config, cfg_attr, new_val)
+                os.environ[env_key] = str(new_val)
+                db.config_set(env_key.lower(), new_val)
+                ohlcv_changes.append(f"{label}: {old_val:.2f} -> {new_val:.2f}")
+        logger.info(f"OHLCV backtest: {len(ohlcv_report.get('symbols', []))} symbols")
+    except Exception as e:
+        logger.warning(f"OHLCV backtest failed: {e} -- using DB analysis only")
+
+    # Step 2: DB-based fine tuning
+    db_results = run_backtest()
+    db_changes = apply_adjustments(db_results)
+    all_changes = ohlcv_changes + db_changes
+
+    lines = [
+        "<b>\U0001f527 Weekly Autotuner Report</b>",
+        "OHLCV reali (30gg) + analisi DB",
+        "",
+        "Trades: " + str(db_results['trade_count'])
+        + " | Win: " + f"{db_results['win_rate']:.0%}"
+        + " | PnL: " + f"{db_results['total_pnl']:+.2f}" + " USDC",
+    ]
+    if all_changes:
+        lines += ["", "<b>Aggiustamenti:</b>"] + ["  \u2022 " + c for c in all_changes]
     else:
-        report += "\nNo adjustments needed — thresholds optimal."
+        lines.append("Nessun aggiustamento -- parametri ottimali.")
 
-    await notify.send(report)
-    logger.info(f"Autotuner done. Changes: {changes}")
-
+    await notify.send("\n".join(lines))
+    logger.info(f"Autotuner done. Changes: {all_changes}")
 
 async def start_autotuner_loop() -> None:
     """Background loop: run every Sunday at 03:00 UTC."""

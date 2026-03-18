@@ -23,7 +23,7 @@ import db
 import indicators as ind
 import order_book
 import sentiment as sent
-from binance_client import client, BinanceError
+from binance_client import client, futures_client, BinanceError
 from config import config
 from intelligence import intelligence, LLMValidation
 from listing_detector import listing_detector, NewListing
@@ -67,6 +67,7 @@ class TradeSignal:
     mtf_score: float = 0.0        # multi-timeframe confluence score
     mtf_direction: str = "neutral" # "long", "short", "neutral"
     mtf_agreement: int = 0         # 0-3 timeframes agreeing
+    sma50_above: bool = True       # price > SMA50 on 1h (trend filter)
 
 
 class TradingEngine:
@@ -96,6 +97,9 @@ class TradingEngine:
 
         # Daily report
         self._last_report_date: str = ""
+
+        # Drawdown alert — track last alert threshold to avoid spam
+        self._dd_alert_sent_pct: float = 0.0
 
 
     # ── State ─────────────────────────────────────────────────────────────────
@@ -171,6 +175,10 @@ class TradingEngine:
         """Check each open position for stop/TP/trail/timeout."""
         positions = db.get_positions()
         for pos in positions:
+            # Handle short positions separately
+            if pos.get("side") == "short":
+                await self._manage_short_position(pos)
+                continue
             symbol = pos["symbol"]
             try:
                 price = await client.ticker_price(symbol)
@@ -285,10 +293,22 @@ class TradingEngine:
         self._equity_history = [(t, v) for t, v in self._equity_history if t >= cutoff]
         if portfolio_value > self._peak_equity:
             self._peak_equity = portfolio_value
+            # Reset alert threshold when equity recovers to new peak
+            self._dd_alert_sent_pct = 0.0
         if self._peak_equity > 0:
             dd = (self._peak_equity - portfolio_value) / self._peak_equity * 100
             if dd > self._max_drawdown:
                 self._max_drawdown = dd
+            # Send alert if drawdown crosses threshold (and not already alerted at this level)
+            alert_threshold = config.drawdown_alert_pct
+            if dd >= alert_threshold and dd >= self._dd_alert_sent_pct + 2.0:
+                self._dd_alert_sent_pct = dd
+                notify.send_sync(
+                    "\u26a0\ufe0f <b>Drawdown Alert</b>\n"
+                    "Equity scesa del " + f"{dd:.1f}" + "% dal picco\n"
+                    "Peak: " + f"{self._peak_equity:.2f}" + " USDC | "
+                    "Now: " + f"{portfolio_value:.2f}" + " USDC"
+                )
 
     # ── Daily report ──────────────────────────────────────────────────────────
 
@@ -407,6 +427,42 @@ class TradingEngine:
         )
         return True
 
+
+    async def _manage_short_position(self, pos: dict) -> None:
+        """Manage stop/TP/timeout for short futures positions."""
+        symbol = pos["symbol"]
+        try:
+            price = await client.ticker_price(symbol)
+        except Exception:
+            return
+        entry = pos["entry_price"]
+        qty   = pos["qty"]
+        stop  = pos["stop_loss"]   # stop is ABOVE entry for shorts
+        tp    = pos["take_profit"]  # TP is BELOW entry for shorts
+
+        # Stop loss: price went up too much
+        if stop > 0 and price >= stop:
+            await self._close_short(symbol, qty, price, "short_stop_loss")
+            return
+
+        # Take profit: price fell to target
+        if tp > 0 and price <= tp:
+            await self._close_short(symbol, qty, price, "short_take_profit")
+            return
+
+        # Timeout
+        entry_ts = pos.get("entry_ts", "")
+        if entry_ts:
+            try:
+                entry_time = datetime.fromisoformat(entry_ts)
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=timezone.utc)
+                age_h = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+                if age_h >= config.max_hold_hours:
+                    await self._close_short(symbol, qty, price, "short_timeout")
+            except Exception:
+                pass
+
     async def _close_position(self, symbol: str, qty: float, price: float, reason: str) -> None:
         pos = db.get_position(symbol)
         if not pos:
@@ -497,6 +553,11 @@ class TradingEngine:
                 config.rsi_oversold, config.rsi_overbought,
             )
 
+            # SMA50 trend filter on 1h
+            closes_1h = [c["close"] for c in candles_1h]
+            sma50_val = ind.sma_last(closes_1h, 50)
+            sma50_above = (sma50_val is None) or (price >= sma50_val)
+
             vol_24h = float(ticker.get("quoteVolume", 0))
 
             ob = await order_book.analyze(symbol, vol_24h)
@@ -525,6 +586,7 @@ class TradingEngine:
             mtf_score=mtf.score,
             mtf_direction=mtf.direction,
             mtf_agreement=mtf.agreement,
+            sma50_above=sma50_above,
         )
 
     def _score_signal(self, sig: TradeSignal) -> float:
@@ -898,6 +960,18 @@ class TradingEngine:
                 if sig:
                     await self._evaluate_entry(sig, portfolio_value)
 
+        # 6. Short opportunities (Futures, if enabled)
+        if config.enable_shorts:
+            all_syms = list(config.safe_symbols) + list(config.aggr_symbols)
+            for symbol in all_syms:
+                pos = db.get_position(symbol)
+                if pos and pos.get("side") == "short":
+                    continue  # already short
+                sig = await self._build_signal(symbol, source="standard",
+                                               pool="safe" if symbol in config.safe_symbols else "aggressive")
+                if sig:
+                    await self._evaluate_short(sig, portfolio_value)
+
         # Update equity tracking and check daily report
         self._update_equity(portfolio_value)
         await self._check_daily_report()
@@ -1086,10 +1160,122 @@ class TradingEngine:
                 "\U0001f9f9 <b>Dust convertito in USDC</b>:\n" + "\n".join(f"  \u2022 {c}" for c in converted)
             )
 
+
+    # ── Short selling (Futures) ───────────────────────────────────────────────
+
+    async def _evaluate_short(self, sig: "TradeSignal", portfolio_value: float) -> bool:
+        """Evaluate and potentially open a short position via Futures."""
+        if not config.enable_shorts:
+            return False
+        # Only short when MTF is clearly bearish
+        if sig.mtf_direction != "short" or sig.mtf_score > -20:
+            return False
+        # Don't short if we have a long on same symbol
+        long_pos = db.get_position(sig.symbol)
+        if long_pos and long_pos.get("side", "long") == "long":
+            return False
+        # Already short this symbol
+        if long_pos and long_pos.get("side") == "short":
+            return False
+        # Cooldown applies to shorts too
+        if self._in_sell_cooldown(sig.symbol):
+            return False
+
+        quote_qty = self._position_size(sig.pool, portfolio_value)
+        if quote_qty < 5:
+            return False
+
+        await self._execute_short(sig, quote_qty)
+        return True
+
+    async def _execute_short(self, sig: "TradeSignal", quote_qty: float) -> None:
+        symbol = sig.symbol
+        try:
+            result = await futures_client.futures_market_short(symbol, quote_qty)
+        except Exception as e:
+            logger.error(f"Short entry error {symbol}: {e}")
+            return
+
+        if config.paper_mode:
+            exec_price = result["price"]
+            qty = result["qty"]
+        else:
+            exec_price = float(result.get("avgPrice", sig.price) or sig.price)
+            qty = float(result.get("executedQty", quote_qty / sig.price))
+
+        # For shorts: stop is ABOVE entry, TP is BELOW entry
+        try:
+            candles = await client.klines(symbol, "15m", limit=20)
+            closes = [c["close"] for c in candles]
+            highs  = [c["high"]  for c in candles]
+            lows   = [c["low"]   for c in candles]
+            atr_v  = ind.atr(highs, lows, closes) or (exec_price * 0.015)
+        except Exception:
+            atr_v = exec_price * 0.015
+
+        stop = exec_price + config.stop_loss_atr * atr_v   # stop ABOVE entry for short
+        tp   = exec_price - config.take_profit_atr * atr_v  # TP BELOW entry for short
+
+        db.save_position(
+            symbol=symbol, entry_price=exec_price, qty=qty,
+            pool=sig.pool, stop_loss=stop, take_profit=tp, side="short",
+        )
+        db.record_trade(
+            symbol=symbol, action="short", price=exec_price, qty=qty,
+            pnl=0.0, reason=f"short: {sig.mtf_direction} score={sig.mtf_score:.0f}",
+            is_paper=config.paper_mode,
+        )
+        await notify.send(
+            "\U0001f534 SHORT " + symbol + "\n"
+            "Price: " + f"{exec_price:.4f}" + " | Qty: " + f"{qty:.4f}" + "\n"
+            "Stop: " + f"{stop:.4f}" + " | TP: " + f"{tp:.4f}" + "\n"
+            "Leverage: " + str(config.futures_leverage) + "x | "
+            "MTF: " + f"{sig.mtf_score:.1f}"
+        )
+        logger.info(f"Short opened: {symbol} @ {exec_price:.4f} stop={stop:.4f} tp={tp:.4f}")
+
+    async def _close_short(self, symbol: str, qty: float, price: float, reason: str) -> None:
+        pos = db.get_position(symbol)
+        if not pos:
+            return
+        entry_price = pos["entry_price"]
+        # Short PnL: profit when price falls
+        pnl = (entry_price - price) * qty * config.futures_leverage
+
+        try:
+            await futures_client.futures_close_short(symbol, qty)
+        except Exception as e:
+            logger.error(f"Close short error {symbol}: {e}")
+            return
+
+        db.record_trade(
+            symbol=symbol, action="close_short", price=price, qty=qty,
+            pnl=pnl, reason=reason, is_paper=config.paper_mode,
+        )
+        db.delete_position(symbol)
+        self._record_sell_cooldown(symbol)
+
+        emoji = "\u2705" if pnl > 0 else "\u274c"
+        await notify.send(
+            emoji + " CLOSED SHORT " + symbol + "\n"
+            "Entry: " + f"{entry_price:.4f}" + " -> Exit: " + f"{price:.4f}" + "\n"
+            "PnL: " + f"{pnl:+.2f}" + " USDC | Reason: " + reason
+        )
+        if pnl < 0:
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
+        logger.info(f"Short closed: {symbol} pnl={pnl:+.2f} reason={reason}")
+
     async def start(self) -> None:
         self._running = True
         self._ws_prices: dict[str, float] = {}
         logger.info("TradingEngine started")
+
+        # Start futures client if shorts are enabled
+        if config.enable_shorts:
+            await futures_client.start()
+            logger.info("Futures client started (shorts enabled)")
 
         # Import existing Binance positions and clean dust on startup
         await self._import_existing_positions()

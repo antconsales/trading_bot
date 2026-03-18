@@ -277,3 +277,139 @@ class BinanceClient:
 
 # Singleton
 client = BinanceClient()
+
+# ── Binance USDT-M Futures Client (for short selling) ─────────────────────────
+
+FUTURES_REST = "https://fapi.binance.com"
+
+
+class FuturesClient:
+    """Minimal Binance USDT-M Futures client — short selling only."""
+
+    def __init__(self):
+        self._session: aiohttp.ClientSession | None = None
+
+    async def start(self) -> None:
+        self._session = aiohttp.ClientSession()
+
+    async def stop(self) -> None:
+        if self._session:
+            await self._session.close()
+
+    def _sign(self, params: dict) -> dict:
+        import hashlib, hmac
+        params["timestamp"] = int(time.time() * 1000)
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        sig = hmac.new(
+            config.binance_api_secret.encode(),
+            qs.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        params["signature"] = sig
+        return params
+
+    async def _post(self, path: str, params: dict) -> Any:
+        if not self._session:
+            raise RuntimeError("FuturesClient not started")
+        signed = self._sign(params)
+        async with self._session.post(
+            f"{FUTURES_REST}{path}",
+            params=signed,
+            headers={"X-MBX-APIKEY": config.binance_api_key},
+        ) as r:
+            data = await r.json()
+            if isinstance(data, dict) and "code" in data and data["code"] != 200:
+                raise BinanceError(data["code"], data.get("msg", "futures error"))
+            return data
+
+    async def _get(self, path: str, params: dict | None = None, signed: bool = False) -> Any:
+        if not self._session:
+            raise RuntimeError("FuturesClient not started")
+        p = params or {}
+        if signed:
+            p = self._sign(p)
+        async with self._session.get(
+            f"{FUTURES_REST}{path}",
+            params=p,
+            headers={"X-MBX-APIKEY": config.binance_api_key},
+        ) as r:
+            return await r.json()
+
+    async def _delete(self, path: str, params: dict) -> Any:
+        if not self._session:
+            raise RuntimeError("FuturesClient not started")
+        signed = self._sign(params)
+        async with self._session.delete(
+            f"{FUTURES_REST}{path}",
+            params=signed,
+            headers={"X-MBX-APIKEY": config.binance_api_key},
+        ) as r:
+            return await r.json()
+
+    async def set_leverage(self, symbol: str, leverage: int) -> None:
+        """Set leverage for a symbol (idempotent)."""
+        await self._post("/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+
+    async def set_margin_type(self, symbol: str) -> None:
+        """Set to ISOLATED margin (safer, default on new symbols)."""
+        try:
+            await self._post("/fapi/v1/marginType", {"symbol": symbol, "marginType": "ISOLATED"})
+        except BinanceError:
+            pass  # Already set
+
+    async def futures_ticker_price(self, symbol: str) -> float:
+        data = await self._get("/fapi/v1/ticker/price", {"symbol": symbol})
+        return float(data["price"])
+
+    async def futures_market_short(self, symbol: str, usdc_qty: float) -> dict:
+        """Open a SHORT position. usdc_qty = USDC margin to use."""
+        if config.paper_mode:
+            price = await self.futures_ticker_price(symbol)
+            contracts = usdc_qty * config.futures_leverage / price
+            return {"price": price, "qty": contracts, "paper": True}
+        await self.set_leverage(symbol, config.futures_leverage)
+        await self.set_margin_type(symbol)
+        price = await self.futures_ticker_price(symbol)
+        qty = usdc_qty * config.futures_leverage / price
+        # Round to exchange step (simplified — use 3 decimal places)
+        qty = round(qty, 3)
+        return await self._post("/fapi/v1/order", {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": qty,
+            "positionSide": "SHORT",
+        })
+
+    async def futures_close_short(self, symbol: str, qty: float) -> dict:
+        """Close a SHORT position by buying back."""
+        if config.paper_mode:
+            price = await self.futures_ticker_price(symbol)
+            return {"price": price, "qty": qty, "paper": True}
+        return await self._post("/fapi/v1/order", {
+            "symbol": symbol,
+            "side": "BUY",
+            "type": "MARKET",
+            "quantity": round(qty, 3),
+            "positionSide": "SHORT",
+            "reduceOnly": "true",
+        })
+
+    async def futures_get_position(self, symbol: str) -> dict | None:
+        """Get current futures position for symbol."""
+        data = await self._get("/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
+        if isinstance(data, list):
+            for p in data:
+                if p.get("symbol") == symbol and float(p.get("positionAmt", 0)) != 0:
+                    return p
+        return None
+
+    async def cancel_all_orders(self, symbol: str) -> None:
+        try:
+            await self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
+        except BinanceError:
+            pass
+
+
+futures_client = FuturesClient()
+

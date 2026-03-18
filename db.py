@@ -95,6 +95,13 @@ def init(db_path: str) -> None:
     _conn = sqlite3.connect(db_path, check_same_thread=False)
     _conn.row_factory = sqlite3.Row
     _conn.executescript(SCHEMA)
+    # Migrations
+    try:
+        _conn.execute("ALTER TABLE positions ADD COLUMN side TEXT DEFAULT 'long'")
+        _conn.commit()
+        logger.info("Migration: added side column to positions")
+    except Exception:
+        pass  # Column already exists
     _conn.commit()
     logger.info(f"SQLite DB initialized: {db_path}")
 
@@ -175,13 +182,14 @@ def save_position(
     stop_loss: float = 0.0,
     take_profit: float = 0.0,
     is_listing: bool = False,
+    side: str = "long",
 ) -> None:
     now = _now()
     _db().execute(
         """INSERT INTO positions
                (symbol, entry_price, qty, pool, stop_loss, take_profit,
-                trail_price, highest_price, original_qty, is_listing, entry_ts, updated_ts)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                trail_price, highest_price, original_qty, is_listing, side, entry_ts, updated_ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(symbol) DO UPDATE SET
                entry_price=excluded.entry_price,
                qty=excluded.qty,
@@ -192,9 +200,10 @@ def save_position(
                highest_price=excluded.highest_price,
                original_qty=excluded.original_qty,
                is_listing=excluded.is_listing,
+               side=excluded.side,
                updated_ts=excluded.updated_ts""",
         (symbol, entry_price, qty, pool, stop_loss, take_profit,
-         entry_price, entry_price, qty, int(is_listing), now, now),
+         entry_price, entry_price, qty, int(is_listing), side, now, now),
     )
     _db().commit()
 

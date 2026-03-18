@@ -85,6 +85,13 @@ class Config:
     autotuner_day: int = 6               # Sunday (0=Mon, 6=Sun)
     autotuner_hour: int = 3
 
+    # ── Drawdown alert ─────────────────────────────────────────────────
+    drawdown_alert_pct: float = field(default_factory=lambda: float(os.getenv("DRAWDOWN_ALERT_PCT", "5.0")))
+
+    # ── Futures / short selling ────────────────────────────────────────
+    enable_shorts: bool = field(default_factory=lambda: os.getenv("ENABLE_SHORTS", "false").lower() == "true")
+    futures_leverage: int = field(default_factory=lambda: int(os.getenv("FUTURES_LEVERAGE", "2")))
+
     # ── Trading pairs — safe pool (large caps, 70% capital) ───────────────
     safe_symbols: tuple = ("BTCUSDC", "ETHUSDC", "SOLUSDC", "XRPUSDC")
 

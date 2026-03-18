@@ -36,6 +36,12 @@ KLINES_LIMIT = 1000   # max per request
 
 ENTRY_SCORE_MIN = 55.0   # matches engine default
 
+# Slippage model: Binance taker fee (0.1%) + market impact (~0.05%)
+# Applied per side — round-trip cost ~0.3%
+SLIPPAGE_BUY  = 0.0010   # entry fills 0.10% above signal close
+SLIPPAGE_SELL = 0.0010   # exit fills 0.10% below signal close
+
+
 # Grid of thresholds to test
 RSI_OVERSOLD_RANGE  = [25, 30, 33, 35, 38, 40]
 RSI_OB_RANGE        = [60, 62, 65, 68, 70, 75]
@@ -221,7 +227,7 @@ def simulate_trades(
                 atr_v = ind.atr(highs[:i+1], lows[:i+1], closes[:i+1], 14)
                 if atr_v is None or atr_v == 0:
                     continue
-                entry_price = closes[i]
+                entry_price = closes[i] * (1 + SLIPPAGE_BUY)   # slippage on entry
                 stop_price  = entry_price - params.stop_atr_mult * atr_v
                 tp_price    = entry_price + params.tp_atr_mult   * atr_v
                 entry_bar   = i
@@ -231,16 +237,19 @@ def simulate_trades(
             bars  = i - entry_bar
 
             if price <= stop_price:
-                pnl = (stop_price - entry_price) / entry_price * 100
-                results.append(TradeResult(entry_price, stop_price, pnl, bars, False))
+                exit_price = stop_price * (1 - SLIPPAGE_SELL)  # slippage on stop
+                pnl = (exit_price - entry_price) / entry_price * 100
+                results.append(TradeResult(entry_price, exit_price, pnl, bars, False))
                 in_trade = False
             elif price >= tp_price:
-                pnl = (tp_price - entry_price) / entry_price * 100
-                results.append(TradeResult(entry_price, tp_price, pnl, bars, True))
+                exit_price = tp_price * (1 - SLIPPAGE_SELL)    # slippage on TP
+                pnl = (exit_price - entry_price) / entry_price * 100
+                results.append(TradeResult(entry_price, exit_price, pnl, bars, True))
                 in_trade = False
             elif bars >= max_hold:
-                pnl = (price - entry_price) / entry_price * 100
-                results.append(TradeResult(entry_price, price, pnl, bars, pnl > 0))
+                exit_price = price * (1 - SLIPPAGE_SELL)        # slippage on timeout
+                pnl = (exit_price - entry_price) / entry_price * 100
+                results.append(TradeResult(entry_price, exit_price, pnl, bars, pnl > 0))
                 in_trade = False
 
     return results
